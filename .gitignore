@@ -1,6 +1,7 @@
 # virtual env
 .venv/
 .venv2/
+.python-version
 
 # python cache
 __pycache__/
