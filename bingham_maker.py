@@ -69,26 +69,26 @@ def simple_bingham_unit(before_rotation_3dvec, after_rotation_3dvec, parameter=1
 #     K = Lmat(left_quat) @ Rmat(right_quat)
 #     return K @ A @ K.T
 
-print(P)
-print(q)
-print(np.linalg.eigh(simple_bingham_unit(x, R @ x)))
+# print(P)
+# print(q)
+# print(np.linalg.eigh(simple_bingham_unit(x, R @ x)))
 
-print(P @ q)
+# print(P @ q)
 
 c = np.dot(x,y)
 
 v = np.array([0, 1, 0])
 # v = (lambda x: x / np.linalg.norm(x))(np.random.randn(3))
-theta = 0.3
-qv = Quaternion(np.cos(theta), *(v * np.sin(theta)))
 
-Qv = np.outer(qv.array(), qv.array())
+def parametrize_Qv(alpha, beta, v, theta):
+    Pv = simple_bingham_unit(v, v, parameter=1.)
+    qv = Quaternion(np.cos(theta), *(v * np.sin(theta)))
+    Qv = np.outer(qv.array(), qv.array())
 
-Pv = simple_bingham_unit(v, v, parameter=1.)
+    alpha = np.clip(alpha, 1e-6, np.inf) / 1000
+    beta = np.clip(beta, 1e-6, np.inf) / 1000
+    return Pv / alpha + (Qv - np.eye(4)) / beta
 
-def parametrize_Qv(alpha):
-  return Pv + alpha*(Qv - np.eye(4))
+Qv = parametrize_Qv(0.5, 20, v, 0.2)
 
-## TODO: keep stable of the angle variance for modifying scaling parameter 
-
-print(np.linalg.eigh(parametrize_Qv(0.4)))
+print(np.linalg.eigh(Qv))
