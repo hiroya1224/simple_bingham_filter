@@ -64,6 +64,9 @@ echo "==> install deps in safe order (known-good combo)"
 "${VPIP}" install "pin==2.7.*"
 # 4) scikit-robot (newer to match scipy>=1.13)
 "${VPIP}" install "scikit-robot>=0.0.36"
+# 5) ikpy==3.4.2
+"${VPIP}" install "ikpy==3.4.2"
+
 
 echo "==> compute site-packages dir (for guard)"
 SP_DIR="$("${VPY}" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
@@ -92,12 +95,13 @@ PY
 
 echo "==> sanity import test (use 'import pinocchio')"
 "${VPY}" - <<'PY'
-import sys, numpy, pinocchio, skrobot, scipy, matplotlib
+import sys, numpy, pinocchio, skrobot, scipy, matplotlib, ikpy
 print("numpy :", numpy.__version__, numpy.__file__)
 print("pino  :", pinocchio.__version__)
 print("skrob :", skrobot.__version__)
 print("scipy :", scipy.__version__)
 print("mpl   :", matplotlib.__version__)
+print("ikpy  :", ikpy.__version__)
 print("env ok")
 PY
 

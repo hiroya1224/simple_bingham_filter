@@ -1,13 +1,90 @@
-# Sequential Kp estimation with UKF (scalar measurement): y = q^T A q
+# Sequential Kp estimation with UKF + alternating control:
+# (1) rigid IK step -> (2) UKF update -> (3) gravity-aware correction step
+#
 # Requirements: pinocchio, numpy, scipy, matplotlib
+#   pip install pin pinocchio numpy scipy matplotlib
+#
+# Notes:
+# - Generates a minimal 6R URDF locally if missing.
+# - Uses S^1-Newton to solve gravity+Kp equilibrium inside the gravity-aware step.
+# - Kp from UKF is exponentially smoothed (EMA) only; no extra stabilizers.
+
 import os
 import numpy as np
 import pinocchio as pin
-from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation as Rsc
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from typing import Optional
+
+# ------------------------ URDF helper ------------------------
+def ensure_urdf():
+    urdf_path = os.path.abspath("simple6r.urdf")
+    if not os.path.exists(urdf_path):
+        txt = """<?xml version="1.0"?>
+<robot name="simple6r">
+  <link name="base_link"/>
+  {links}
+  <joint name="joint1" type="revolute">
+    <parent link="base_link"/><child link="link1"/>
+    <origin xyz="0 0 0.10" rpy="0 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-3.1416" upper="3.1416" effort="150" velocity="2.5"/>
+  </joint>
+  <joint name="joint2" type="revolute">
+    <parent link="link1"/><child link="link2"/>
+    <origin xyz="0 0 0.20" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-2.61799" upper="2.61799" effort="120" velocity="2.5"/>
+  </joint>
+  <joint name="joint3" type="revolute">
+    <parent link="link2"/><child link="link3"/>
+    <origin xyz="0 0 0.20" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-2.61799" upper="2.61799" effort="120" velocity="2.5"/>
+  </joint>
+  <joint name="joint4" type="revolute">
+    <parent link="link3"/><child link="link4"/>
+    <origin xyz="0 0 0.20" rpy="0 0 0"/><axis xyz="1 0 0"/>
+    <limit lower="-3.1416" upper="3.1416" effort="60" velocity="3.0"/>
+  </joint>
+  <joint name="joint5" type="revolute">
+    <parent link="link4"/><child link="link5"/>
+    <origin xyz="0 0 0.18" rpy="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-3.1416" upper="3.1416" effort="60" velocity="3.0"/>
+  </joint>
+  <joint name="joint6" type="revolute">
+    <parent link="link5"/><child link="link6"/>
+    <origin xyz="0 0 0.12" rpy="0 0 0"/><axis xyz="1 0 0"/>
+    <limit lower="-3.1416" upper="3.1416" effort="40" velocity="3.5"/>
+  </joint>
+</robot>""".format(
+    links="\n".join([
+        f"""
+  <link name="link{i}">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="{1.0 if i<=3 else 0.5}"/>
+      <inertia ixx="0.003" ixy="0.0" ixz="0.0" iyy="0.003" iyz="0.0" izz="0.001"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.03" length="{0.20 if i<=4 else 0.12}"/></geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.03" length="{0.20 if i<=4 else 0.12}"/></geometry>
+    </collision>
+  </link>
+        """.strip()
+        for i in range(1, 7)
+    ]))
+        with open(urdf_path, "w") as f:
+            f.write(txt)
+    return urdf_path
+
+def rpy_to_matrix(r, p, y):
+    if hasattr(pin, "rpy") and hasattr(pin.rpy, "rpyToMatrix"):
+        return pin.rpy.rpyToMatrix(r, p, y)
+    else:
+        return pin.utils.rpyToMatrix(r, p, y)
 
 # ------------------------ Quaternion helpers for Bingham A ------------------------
 class Quaternion:
@@ -17,7 +94,6 @@ class Quaternion:
         self.x = x
         self.y = y
         self.z = z
-
     def array(self):
         return self._array
 
@@ -116,18 +192,6 @@ class SixRArmKpEstimator:
         gee = R_be @ gb_unit
         return gee / (np.linalg.norm(gee) + 1e-12)
 
-    # ---------- dataset: build dynamic A per time-step from true Kp* ----------
-    def build_dynamicA_timeseries(self, qdes_seq: list, kp_true: np.ndarray, g_base: np.ndarray, parameter: float = 1000.0):
-        A_seq = []
-        qeq_true_seq = []
-        for q_des in qdes_seq:
-            q_eq_true = self.calc_equilibrium_s1(q_des, kp_true)
-            gee_true = self.gravity_dir_in_ee(q_eq_true, g_base)
-            A_t = simple_bingham_unit(g_base, gee_true, parameter=parameter)
-            A_seq.append(A_t)
-            qeq_true_seq.append(q_eq_true)
-        return A_seq, qeq_true_seq
-
     # ---------- geometry & visualization ----------
     def joint_positions(self, q: np.ndarray, link_name_tip: Optional[str] = None) -> np.ndarray:
         pin.forwardKinematics(self.model, self.data, q)
@@ -169,47 +233,18 @@ class SixRArmKpEstimator:
                     [origin[1], origin[1] + axis[1]],
                     [origin[2], origin[2] + axis[2]], c)
 
-    def visualize_compare(self, q_des: np.ndarray, q_eq: np.ndarray, link_name_tip: Optional[str] = None, title: str = "6R arm: q_des vs q_eq"):
-        p_des = self.joint_positions(q_des, link_name_tip)
-        p_eq = self.joint_positions(q_eq, link_name_tip)
-
-        fig = plt.figure(figsize=(6, 6))
-        ax = fig.add_subplot(111, projection="3d")
-
-        self.plot_arm_positions(ax, p_des, {"linestyle": "--"}, label="q_des")
-        self.plot_arm_positions(ax, p_eq, {"linewidth": 2}, label="q_eq")
-        self.draw_frames(ax, q_eq, link_name_tip, axis_length=0.05)
-
-        ax.set_xlabel("X [m]")
-        ax.set_ylabel("Y [m]")
-        ax.set_zlabel("Z [m]")
-        ax.set_title(title)
-        ax.legend()
-
-        all_pts = np.vstack([p_des, p_eq])
-        center = all_pts.mean(axis=0)
-        radius = np.max(np.linalg.norm(all_pts - center, axis=1))
-        radius = max(radius, 0.2)
-        ax.set_xlim(center[0] - radius, center[0] + radius)
-        ax.set_ylim(center[1] - radius, center[1] + radius)
-        ax.set_zlim(center[2] - radius, center[2] + radius)
-        ax.view_init(elev=25, azim=45)
-        plt.gca().set_box_aspect([1, 1, 1])
-        plt.tight_layout()
-        plt.show()
-
-    # === Add to SixRArmKpEstimator ==============================================
-
     def se3_error(self, T_cur: pin.SE3, T_des: pin.SE3) -> np.ndarray:
-        """6D body-frame error: e = [dp; log(R_err)], with E = T_cur^{-1} * T_des."""
         E = T_cur.inverse() * T_des
         dp = E.translation
         dth = pin.log3(E.rotation)
         return np.hstack([dp, dth])
 
     def frame_jacobian_local(self, q: np.ndarray, frame_id: int) -> np.ndarray:
+        # ensure joint Jacobians and frame placements are up to date
+        pin.computeJointJacobians(self.model, self.data, q)
+        pin.updateFramePlacements(self.model, self.data)
         ref = pin.ReferenceFrame.LOCAL if hasattr(pin, "ReferenceFrame") else pin.LOCAL
-        J6 = pin.computeFrameJacobian(self.model, self.data, q, frame_id, ref)
+        J6 = pin.getFrameJacobian(self.model, self.data, frame_id, ref)
         return J6  # (6, nv)
 
     def draw_pose_axes(self, ax, T: pin.SE3, axis_length: float = 0.07):
@@ -222,8 +257,8 @@ class SixRArmKpEstimator:
         ax.scatter([o[0]], [o[1]], [o[2]], s=30, c="k")
 
     def visualize_with_target(self, q_des: np.ndarray, q_eq: np.ndarray, T_des: pin.SE3,
-                            link_name_tip: Optional[str] = None,
-                            title: str = "Gravity IK (q_des vs q_eq vs target)"):
+                              link_name_tip: Optional[str] = None,
+                              title: str = "Gravity IK (q_des vs q_eq vs target)"):
         p_des = self.joint_positions(q_des, link_name_tip)
         p_eq = self.joint_positions(q_eq, link_name_tip)
 
@@ -235,16 +270,53 @@ class SixRArmKpEstimator:
         self.draw_frames(ax, q_eq, link_name_tip, axis_length=0.05)
         self.draw_pose_axes(ax, T_des, axis_length=0.07)
 
-        ax.set_xlabel("X [m]"); ax.set_ylabel("Y [m]"); ax.set_zlabel("Z [m]")
-        ax.set_title(title); ax.legend()
+        ax.set_xlabel("X [m]")
+        ax.set_ylabel("Y [m]")
+        ax.set_zlabel("Z [m]")
+        ax.set_title(title)
+        ax.legend()
 
         all_pts = np.vstack([p_des, p_eq, T_des.translation.reshape(1,3)])
-        c = all_pts.mean(axis=0)
-        r = max(np.max(np.linalg.norm(all_pts - c, axis=1)), 0.2)
-        ax.set_xlim(c[0]-r, c[0]+r); ax.set_ylim(c[1]-r, c[1]+r); ax.set_zlim(c[2]-r, c[2]+r)
-        ax.view_init(elev=25, azim=45); plt.gca().set_box_aspect([1,1,1])
-        plt.tight_layout(); plt.show()
+        center = all_pts.mean(axis=0)
+        radius = np.max(np.linalg.norm(all_pts - center, axis=1))
+        radius = max(radius, 0.2)
+        ax.set_xlim(center[0] - radius, center[0] + radius)
+        ax.set_ylim(center[1] - radius, center[1] + radius)
+        ax.set_zlim(center[2] - radius, center[2] + radius)
+        ax.view_init(elev=25, azim=45)
+        plt.gca().set_box_aspect([1, 1, 1])
+        plt.tight_layout()
+        plt.show()
 
+    # ---------- Rigid IK (no gravity) ----------
+    def ik_step_rigid(self,
+        q: np.ndarray,
+        T_des: pin.SE3,
+        w_pos: float = 1.0,
+        w_rot: float = 0.3,
+        lambda_damp: float = 1e-4,
+        step_scale: float = 1.0,
+        use_limits: bool = True,
+    ):
+        fid = self.tip_fid
+        pin.forwardKinematics(self.model, self.data, q)
+        pin.updateFramePlacements(self.model, self.data)
+        T_cur = self.data.oMf[fid]
+        e = self.se3_error(T_cur, T_des)  # (6,)
+        J6 = self.frame_jacobian_local(q, fid)  # (6, nv)
+        W = np.diag([w_pos, w_pos, w_pos, w_rot, w_rot, w_rot])
+        H = J6.T @ W @ J6 + lambda_damp * np.eye(self.nv)
+        g = J6.T @ W @ e
+        dq = - np.linalg.solve(H, g)
+        dq = step_scale * dq
+        q_new = q + dq
+        if use_limits and hasattr(self.model, "lowerPositionLimit"):
+            lo = self.model.lowerPositionLimit; hi = self.model.upperPositionLimit
+            q_new = np.minimum(np.maximum(q_new, lo), hi)
+        info = {"err_norm": float(np.linalg.norm(e)), "dq_norm": float(np.linalg.norm(dq))}
+        return q_new, info
+
+    # ---------- Gravity-aware outer step (simple "lively" version) ----------
     def ik_step_gravity(self,
         q_des: np.ndarray,
         kp_vec: np.ndarray,
@@ -255,40 +327,37 @@ class SixRArmKpEstimator:
         step_scale: float = 1.0,
         use_limits: bool = True,
     ):
-        """
-        One outer-step: with fixed Kp, move q_des so that equilibrium under gravity moves toward T_des.
-        Returns q_des_new, q_eq, info.
-        """
         nv = self.nv
         K = np.diag(kp_vec)
         fid = self.tip_fid
 
-        # 1) inner equilibrium at current q_des
+        # inner equilibrium at current q_des
         q_eq = self.calc_equilibrium_s1(q_des, kp_vec)
 
-        # 2) task error at q_eq
+        # task error at q_eq
         pin.forwardKinematics(self.model, self.data, q_eq)
         pin.updateFramePlacements(self.model, self.data)
         T_cur = self.data.oMf[fid]
         e = self.se3_error(T_cur, T_des)  # (6,)
 
-        # 3) M = J (G+K)^{-1} K
+        # M = J (G+K)^{-1} K
         J6 = self.frame_jacobian_local(q_eq, fid)  # (6, nv)
         G = pin.computeGeneralizedGravityDerivatives(self.model, self.data, q_eq)  # (nv, nv)
         A = G + K
-        B = np.linalg.solve(A, K)    # (nv, nv)
-        M = J6 @ B                   # (6, nv)
+        B = np.linalg.solve(A, K)        # (nv, nv)
+        M = J6 @ B                        # (6, nv)
 
-        # 4) damped least squares on q_des
+        # damped least squares on q_des
         W = np.diag([w_pos, w_pos, w_pos, w_rot, w_rot, w_rot])
         H = M.T @ W @ M + lambda_damp * np.eye(nv)
         g = M.T @ W @ e
-        dq_des = - np.linalg.solve(H, g)
-        dq_des = step_scale * dq_des
+        dq_des = -np.linalg.solve(H, g)
 
+        # update
+        dq_des = step_scale * dq_des
         q_des_new = q_des + dq_des
 
-        # 5) joint limits
+        # joint limits
         if use_limits and hasattr(self.model, "lowerPositionLimit"):
             lo = self.model.lowerPositionLimit
             hi = self.model.upperPositionLimit
@@ -299,7 +368,6 @@ class SixRArmKpEstimator:
             "dq_norm": float(np.linalg.norm(dq_des)),
         }
         return q_des_new, q_eq, info
-
 
 # ------------------------ UKF for x = log(Kp) with scalar measurement ------------------------
 class LogKpUKF:
@@ -324,12 +392,10 @@ class LogKpUKF:
     def _sigma_points(self, x: np.ndarray, P: np.ndarray) -> np.ndarray:
         n = self.n
         jitter = 1e-10
-        # ensure PSD
         Psym = 0.5 * (P + P.T) + jitter * np.eye(n)
         try:
             S = np.linalg.cholesky(self.c * Psym)
         except np.linalg.LinAlgError:
-            # add more jitter if needed
             S = np.linalg.cholesky(self.c * (Psym + 1e-8 * np.eye(n)))
         sigmas = np.zeros((2 * n + 1, n))
         sigmas[0] = x
@@ -344,132 +410,129 @@ class LogKpUKF:
         self.P = self.P + self.Q
 
     def update(self, z_t: float, q_des_t: np.ndarray, A_t: np.ndarray, estimator: SixRArmKpEstimator):
-        # sigma points
         sigmas = self._sigma_points(self.x, self.P)
-
-        # propagate through measurement: h(x) = q(x)^T A_t q(x)
         y_sig = np.zeros(sigmas.shape[0])
         for i, xs in enumerate(sigmas):
             kp_vec = np.exp(xs)
             q_eq = estimator.calc_equilibrium_s1(q_des_t, kp_vec)
             q_wxyz = estimator.ee_quaternion_wxyz_base(q_eq)
             y_sig[i] = float(q_wxyz.T @ A_t @ q_wxyz)
-
-        # predicted measurement
         y_pred = np.dot(self.Wm, y_sig)
-
-        # innovation covariance S (scalar) and cross-covariance C (n x 1)
         dy = y_sig - y_pred
         S = float(np.dot(self.Wc, dy * dy)) + self.R
         C = np.sum(self.Wc[:, None] * (sigmas - self.x) * dy[:, None], axis=0).reshape(self.n, 1)
-
-        # Kalman gain (n x 1)
         K = C / (S + 1e-18)
-
-        # update state
         self.x = self.x + (K.flatten() * (z_t - y_pred))
-        # update covariance
         self.P = self.P - K @ K.T * S
-        # symmetrize
         self.P = 0.5 * (self.P + self.P.T)
 
-# === Replace your __main__ block with this demo =================================
+# ------------------------ Main: alternating control loop ------------------------
 if __name__ == "__main__":
-    # estimator and model
-    urdf_path = os.path.abspath("simple6r.urdf")
+    urdf_path = ensure_urdf()
     est = SixRArmKpEstimator(urdf_path, tip_link_name="link6", base_link_name="base_link")
 
-    # ground-truth Kp*
-    kp_true = np.array([30.0, 30.0, 14.0, 9.0, 10.0, 5.0], dtype=float)
-
-    # gravity in base
+    # ground-truth plant stiffness (unknown to estimator)
+    kp_true = np.array([18.0, 12.0, 14.0, 9.0, 7.0, 5.0], dtype=float)
     g_base = np.array([0.0, 0.0, -9.8])
 
-    # target end-effector pose (reachable one)
+    # target pose
     p_des = np.array([0.35, 0.05, 0.45])
-    R_des = pin.rpy.rpyToMatrix(0.0, 0.0, 0.0)  # yaw-pitch-roll = 0
+    R_des = rpy_to_matrix(0.0, 0.0, 0.0)
     T_des = pin.SE3(R_des, p_des)
 
-    # UKF init on x = log(Kp)
+    # UKF on x=log(Kp)
     x0 = np.log(np.ones(est.nv) * 25.0)
     P0 = np.eye(est.nv) * 1.0
     Q = np.eye(est.nv) * 1e-3
     R_scalar = 1e-6
     ukf = LogKpUKF(x0, P0, Q, R_scalar, alpha=1e-2, beta=2.0, kappa=0.0)
 
-    # controller initial reference and options
+    # Kp EMA (smoothing only)
+    ema_eta = 0.2
+    kp_hat_prev = np.exp(ukf.x).copy()
+    kp_min = 1e-6
+
+    # controller reference
     q_des_ctrl = np.zeros(est.nv)
-    T = 80                       # time steps (outer updates)
-    w_pos = 1.0; w_rot = 0.4
-    lambda_damp = 1e-5
-    step_scale = 1.0             # 1 step per outer iteration
+
+    # loop parameters
+    T = 80
+    w_pos_rigid, w_rot_rigid = 1.0, 0.3
+    w_pos_grav,  w_rot_grav  = 1.0, 0.3
+    lam_rigid = 1e-4
+    lam_grav  = 1e-5
+    step_scale_rigid = 1.0
+    step_scale_grav  = 1.0
 
     # logs
     kph_seq = []
     qeq_seq = []
-    err_seq = []
+    err_rig_seq = []
+    err_grav_seq = []
     qdes_seq_ctrl = []
 
-    # live viz (optional)
-    live_plot = True
-    plot_every = 5
-    if live_plot:
-        plt.ion()
-        fig = plt.figure(figsize=(6,6))
-        ax = fig.add_subplot(111, projection="3d")
+    # live viz
+    plt.ion()
+    fig = plt.figure(figsize=(6,6))
+    ax = fig.add_subplot(111, projection="3d")
 
     for t in range(T):
-        # --- (1) Build measurement A_t from true plant at current q_des_ctrl
-        #     (this simulates how your scalar y originates from the true system)
+        # (A) rigid IK step (no gravity)
+        q_des_ctrl, info_rig = est.ik_step_rigid(
+            q=q_des_ctrl, T_des=T_des,
+            w_pos=w_pos_rigid, w_rot=w_rot_rigid,
+            lambda_damp=lam_rigid,
+            step_scale=step_scale_rigid,
+            use_limits=True
+        )
+        err_rig_seq.append(info_rig["err_norm"])
+
+        # (B) UKF update from "plant" scalar measurement at current reference
         q_eq_true = est.calc_equilibrium_s1(q_des_ctrl, kp_true)
         gee_true = est.gravity_dir_in_ee(q_eq_true, g_base)
         A_t = simple_bingham_unit(g_base, gee_true, parameter=1000.0)
-
-        # --- (2) UKF step with current q_des_ctrl
         ukf.predict()
-        z_t = 0.0                         # target scalar measurement y=0
+        z_t = 0.0
         ukf.update(z_t, q_des_ctrl, A_t, est)
-        kp_hat_t = np.exp(ukf.x)
+
+        # EMA smoothing of Kp
+        kp_raw = np.exp(ukf.x)
+        kp_hat_t = (1.0 - ema_eta) * kp_hat_prev + ema_eta * kp_raw
+        kp_hat_t = np.maximum(kp_hat_t, kp_min)
+        kp_hat_prev = kp_hat_t.copy()
         kph_seq.append(kp_hat_t.copy())
 
-        # --- (3) One IK step under current Kp estimate to move toward T_des
-        q_des_ctrl, q_eq_ctrl, info = est.ik_step_gravity(
-            q_des=q_des_ctrl,
-            kp_vec=kp_hat_t,
-            T_des=T_des,
-            w_pos=w_pos, w_rot=w_rot,
-            lambda_damp=lambda_damp,
-            step_scale=step_scale,
+        # (C) gravity-aware correction step using current Kp estimate
+        q_des_ctrl, q_eq_ctrl, info_grav = est.ik_step_gravity(
+            q_des=q_des_ctrl, kp_vec=kp_hat_t, T_des=T_des,
+            w_pos=w_pos_grav, w_rot=w_rot_grav,
+            lambda_damp=lam_grav,
+            step_scale=step_scale_grav,
             use_limits=True
         )
         qeq_seq.append(q_eq_ctrl.copy())
         qdes_seq_ctrl.append(q_des_ctrl.copy())
-        err_seq.append(info["err_norm"])
+        err_grav_seq.append(info_grav["err_norm"])
 
-        # --- (4) live visualization
-        if live_plot and (t % plot_every == 0 or t == T-1):
-            ax.cla()
-            # draw current
-            p_des_arm = est.joint_positions(q_des_ctrl)
-            p_eq_arm = est.joint_positions(q_eq_ctrl)
-            est.plot_arm_positions(ax, p_des_arm, {"linestyle": "--"}, label="q_des")
-            est.plot_arm_positions(ax, p_eq_arm, {"linewidth": 2}, label="q_eq")
-            est.draw_frames(ax, q_eq_ctrl, axis_length=0.05)
-            est.draw_pose_axes(ax, T_des, axis_length=0.07)
+        # (D) live visualization with target axes
+        ax.cla()
+        p_des_arm = est.joint_positions(q_des_ctrl)
+        p_eq_arm = est.joint_positions(q_eq_ctrl)
+        est.plot_arm_positions(ax, p_des_arm, {"linestyle": "--"}, label="q_des")
+        est.plot_arm_positions(ax, p_eq_arm, {"linewidth": 2}, label="q_eq")
+        est.draw_frames(ax, q_eq_ctrl, axis_length=0.05)
+        est.draw_pose_axes(ax, T_des, axis_length=0.07)
 
-            # fit axes
-            all_pts = np.vstack([p_des_arm, p_eq_arm, T_des.translation.reshape(1,3)])
-            c = all_pts.mean(axis=0)
-            r = max(np.max(np.linalg.norm(all_pts - c, axis=1)), 0.2)
-            ax.set_xlim(c[0]-r, c[0]+r); ax.set_ylim(c[1]-r, c[1]+r); ax.set_zlim(c[2]-r, c[2]+r)
-            ax.set_xlabel("X [m]"); ax.set_ylabel("Y [m]"); ax.set_zlabel("Z [m]")
-            ax.set_title(f"t={t}: err={info['err_norm']:.3e}")
-            ax.legend(); ax.view_init(elev=25, azim=45); plt.gca().set_box_aspect([1,1,1])
-            plt.pause(0.01)
+        all_pts = np.vstack([p_des_arm, p_eq_arm, T_des.translation.reshape(1,3)])
+        c = all_pts.mean(axis=0)
+        r = max(np.max(np.linalg.norm(all_pts - c, axis=1)), 0.2)
+        ax.set_xlim(c[0]-r, c[0]+r); ax.set_ylim(c[1]-r, c[1]+r); ax.set_zlim(c[2]-r, c[2]+r)
+        ax.set_xlabel("X [m]"); ax.set_ylabel("Y [m]"); ax.set_zlabel("Z [m]")
+        ax.set_title(f"t={t}: rigid_err={info_rig['err_norm']:.2e}, grav_err={info_grav['err_norm']:.2e}")
+        ax.legend(); ax.view_init(elev=25, azim=45); plt.gca().set_box_aspect([1,1,1])
+        plt.pause(0.01)
 
-    if live_plot:
-        plt.ioff()
-        plt.show()
+    plt.ioff(); plt.show()
 
     # report
     kp_hat = np.exp(ukf.x)
@@ -478,6 +541,6 @@ if __name__ == "__main__":
     rel_err = np.linalg.norm(kp_hat - kp_true) / (np.linalg.norm(kp_true) + 1e-12)
     print("relative_error =", rel_err)
 
-    # final snapshot figure
+    # final snapshot
     est.visualize_with_target(qdes_seq_ctrl[-1], qeq_seq[-1], T_des,
-                              title="Final: equilibrium meets target (with UKF-updated Kp)")
+                              title="Final: alternating rigid-then-gravity correction")
