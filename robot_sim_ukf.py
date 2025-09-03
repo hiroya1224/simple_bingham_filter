@@ -198,6 +198,109 @@ class SixRArmKpEstimator:
         plt.tight_layout()
         plt.show()
 
+    # === Add to SixRArmKpEstimator ==============================================
+
+    def se3_error(self, T_cur: pin.SE3, T_des: pin.SE3) -> np.ndarray:
+        """6D body-frame error: e = [dp; log(R_err)], with E = T_cur^{-1} * T_des."""
+        E = T_cur.inverse() * T_des
+        dp = E.translation
+        dth = pin.log3(E.rotation)
+        return np.hstack([dp, dth])
+
+    def frame_jacobian_local(self, q: np.ndarray, frame_id: int) -> np.ndarray:
+        ref = pin.ReferenceFrame.LOCAL if hasattr(pin, "ReferenceFrame") else pin.LOCAL
+        J6 = pin.computeFrameJacobian(self.model, self.data, q, frame_id, ref)
+        return J6  # (6, nv)
+
+    def draw_pose_axes(self, ax, T: pin.SE3, axis_length: float = 0.07):
+        colors = ["r", "g", "b"]
+        o = T.translation
+        Rm = T.rotation
+        for k, c in enumerate(colors):
+            a = Rm[:, k] * axis_length
+            ax.plot([o[0], o[0]+a[0]], [o[1], o[1]+a[1]], [o[2], o[2]+a[2]], c, linewidth=2.0)
+        ax.scatter([o[0]], [o[1]], [o[2]], s=30, c="k")
+
+    def visualize_with_target(self, q_des: np.ndarray, q_eq: np.ndarray, T_des: pin.SE3,
+                            link_name_tip: Optional[str] = None,
+                            title: str = "Gravity IK (q_des vs q_eq vs target)"):
+        p_des = self.joint_positions(q_des, link_name_tip)
+        p_eq = self.joint_positions(q_eq, link_name_tip)
+
+        fig = plt.figure(figsize=(6, 6))
+        ax = fig.add_subplot(111, projection="3d")
+
+        self.plot_arm_positions(ax, p_des, {"linestyle": "--"}, label="q_des")
+        self.plot_arm_positions(ax, p_eq, {"linewidth": 2}, label="q_eq")
+        self.draw_frames(ax, q_eq, link_name_tip, axis_length=0.05)
+        self.draw_pose_axes(ax, T_des, axis_length=0.07)
+
+        ax.set_xlabel("X [m]"); ax.set_ylabel("Y [m]"); ax.set_zlabel("Z [m]")
+        ax.set_title(title); ax.legend()
+
+        all_pts = np.vstack([p_des, p_eq, T_des.translation.reshape(1,3)])
+        c = all_pts.mean(axis=0)
+        r = max(np.max(np.linalg.norm(all_pts - c, axis=1)), 0.2)
+        ax.set_xlim(c[0]-r, c[0]+r); ax.set_ylim(c[1]-r, c[1]+r); ax.set_zlim(c[2]-r, c[2]+r)
+        ax.view_init(elev=25, azim=45); plt.gca().set_box_aspect([1,1,1])
+        plt.tight_layout(); plt.show()
+
+    def ik_step_gravity(self,
+        q_des: np.ndarray,
+        kp_vec: np.ndarray,
+        T_des: pin.SE3,
+        w_pos: float = 1.0,
+        w_rot: float = 0.3,
+        lambda_damp: float = 1e-5,
+        step_scale: float = 1.0,
+        use_limits: bool = True,
+    ):
+        """
+        One outer-step: with fixed Kp, move q_des so that equilibrium under gravity moves toward T_des.
+        Returns q_des_new, q_eq, info.
+        """
+        nv = self.nv
+        K = np.diag(kp_vec)
+        fid = self.tip_fid
+
+        # 1) inner equilibrium at current q_des
+        q_eq = self.calc_equilibrium_s1(q_des, kp_vec)
+
+        # 2) task error at q_eq
+        pin.forwardKinematics(self.model, self.data, q_eq)
+        pin.updateFramePlacements(self.model, self.data)
+        T_cur = self.data.oMf[fid]
+        e = self.se3_error(T_cur, T_des)  # (6,)
+
+        # 3) M = J (G+K)^{-1} K
+        J6 = self.frame_jacobian_local(q_eq, fid)  # (6, nv)
+        G = pin.computeGeneralizedGravityDerivatives(self.model, self.data, q_eq)  # (nv, nv)
+        A = G + K
+        B = np.linalg.solve(A, K)    # (nv, nv)
+        M = J6 @ B                   # (6, nv)
+
+        # 4) damped least squares on q_des
+        W = np.diag([w_pos, w_pos, w_pos, w_rot, w_rot, w_rot])
+        H = M.T @ W @ M + lambda_damp * np.eye(nv)
+        g = M.T @ W @ e
+        dq_des = - np.linalg.solve(H, g)
+        dq_des = step_scale * dq_des
+
+        q_des_new = q_des + dq_des
+
+        # 5) joint limits
+        if use_limits and hasattr(self.model, "lowerPositionLimit"):
+            lo = self.model.lowerPositionLimit
+            hi = self.model.upperPositionLimit
+            q_des_new = np.minimum(np.maximum(q_des_new, lo), hi)
+
+        info = {
+            "err_norm": float(np.linalg.norm(e)),
+            "dq_norm": float(np.linalg.norm(dq_des)),
+        }
+        return q_des_new, q_eq, info
+
+
 # ------------------------ UKF for x = log(Kp) with scalar measurement ------------------------
 class LogKpUKF:
     def __init__(self, x0: np.ndarray, P0: np.ndarray, Q: np.ndarray, R_scalar: float,
@@ -270,54 +373,111 @@ class LogKpUKF:
         # symmetrize
         self.P = 0.5 * (self.P + self.P.T)
 
-# ------------------------ Example usage: sequential UKF ------------------------
+# === Replace your __main__ block with this demo =================================
 if __name__ == "__main__":
-    # Assume simple6r.urdf exists
+    # estimator and model
     urdf_path = os.path.abspath("simple6r.urdf")
     est = SixRArmKpEstimator(urdf_path, tip_link_name="link6", base_link_name="base_link")
 
-    # ground-truth Kp*
+    # ground-truth Kp* (simulator側)
     kp_true = np.array([18.0, 12.0, 14.0, 9.0, 7.0, 5.0], dtype=float)
 
     # gravity in base
     g_base = np.array([0.0, 0.0, -9.8])
 
-    # build a slowly varying time series of q_des (quasi-static)
-    T = 60
-    rng = np.random.default_rng(2)
-    q_des = rng.uniform(-0.5, 0.5, size=est.nv)
-    qdes_seq = []
-    for t in range(T):
-        dq = 0.05 * rng.standard_normal(est.nv)  # small step
-        q_des = np.clip(q_des + dq, -1.2, 1.2)
-        qdes_seq.append(q_des.copy())
+    # target end-effector pose (reachable one)
+    p_des = np.array([0.35, 0.05, 0.45])
+    R_des = pin.rpy.rpyToMatrix(0.0, 0.0, 0.0)  # yaw-pitch-roll = 0
+    T_des = pin.SE3(R_des, p_des)
 
-    # construct A_t from true Kp* (measurement-origin, kept fixed per t)
-    A_seq, qeq_true_seq = est.build_dynamicA_timeseries(qdes_seq, kp_true, g_base, parameter=1000.0)
-
-    # UKF init on x = log(Kp): start "large-ish" but stable
-    x0 = np.log(np.ones(est.nv) * 25.0)   # e.g., center 25
-    P0 = np.eye(est.nv) * 1.0             # initial covariance
-    Q = np.eye(est.nv) * 1e-3             # process noise (state random-walk)
-    R_scalar = 1e-6                        # measurement noise variance (scalar)
-
+    # UKF init on x = log(Kp)
+    x0 = np.log(np.ones(est.nv) * 25.0)
+    P0 = np.eye(est.nv) * 1.0
+    Q = np.eye(est.nv) * 1e-3
+    R_scalar = 1e-6
     ukf = LogKpUKF(x0, P0, Q, R_scalar, alpha=1e-2, beta=2.0, kappa=0.0)
 
-    # run filter
-    kph_seq = []
-    for t in range(T):
-        ukf.predict()
-        # target scalar measurement is y=0 (since A_t built from "true" gravity mapping)
-        z_t = 0.0
-        ukf.update(z_t, qdes_seq[t], A_seq[t], est)
-        kph_seq.append(np.exp(ukf.x).copy())
+    # controller initial reference and options
+    q_des_ctrl = np.zeros(est.nv)
+    T = 80                       # time steps (outer updates)
+    w_pos = 1.0; w_rot = 0.4
+    lambda_damp = 1e-5
+    step_scale = 1.0             # 1 step per outer iteration
 
+    # logs
+    kph_seq = []
+    qeq_seq = []
+    err_seq = []
+    qdes_seq_ctrl = []
+
+    # live viz (optional)
+    live_plot = True
+    plot_every = 5
+    if live_plot:
+        plt.ion()
+        fig = plt.figure(figsize=(6,6))
+        ax = fig.add_subplot(111, projection="3d")
+
+    for t in range(T):
+        # --- (1) Build measurement A_t from true plant at current q_des_ctrl
+        #     (this simulates how your scalar y originates from the true system)
+        q_eq_true = est.calc_equilibrium_s1(q_des_ctrl, kp_true)
+        gee_true = est.gravity_dir_in_ee(q_eq_true, g_base)
+        A_t = simple_bingham_unit(g_base, gee_true, parameter=1000.0)
+
+        # --- (2) UKF step with current q_des_ctrl
+        ukf.predict()
+        z_t = 0.0                         # target scalar measurement y=0
+        ukf.update(z_t, q_des_ctrl, A_t, est)
+        kp_hat_t = np.exp(ukf.x)
+        kph_seq.append(kp_hat_t.copy())
+
+        # --- (3) One IK step under current Kp estimate to move toward T_des
+        q_des_ctrl, q_eq_ctrl, info = est.ik_step_gravity(
+            q_des=q_des_ctrl,
+            kp_vec=kp_hat_t,
+            T_des=T_des,
+            w_pos=w_pos, w_rot=w_rot,
+            lambda_damp=lambda_damp,
+            step_scale=step_scale,
+            use_limits=True
+        )
+        qeq_seq.append(q_eq_ctrl.copy())
+        qdes_seq_ctrl.append(q_des_ctrl.copy())
+        err_seq.append(info["err_norm"])
+
+        # --- (4) live visualization
+        if live_plot and (t % plot_every == 0 or t == T-1):
+            ax.cla()
+            # draw current
+            p_des_arm = est.joint_positions(q_des_ctrl)
+            p_eq_arm = est.joint_positions(q_eq_ctrl)
+            est.plot_arm_positions(ax, p_des_arm, {"linestyle": "--"}, label="q_des")
+            est.plot_arm_positions(ax, p_eq_arm, {"linewidth": 2}, label="q_eq")
+            est.draw_frames(ax, q_eq_ctrl, axis_length=0.05)
+            est.draw_pose_axes(ax, T_des, axis_length=0.07)
+
+            # fit axes
+            all_pts = np.vstack([p_des_arm, p_eq_arm, T_des.translation.reshape(1,3)])
+            c = all_pts.mean(axis=0)
+            r = max(np.max(np.linalg.norm(all_pts - c, axis=1)), 0.2)
+            ax.set_xlim(c[0]-r, c[0]+r); ax.set_ylim(c[1]-r, c[1]+r); ax.set_zlim(c[2]-r, c[2]+r)
+            ax.set_xlabel("X [m]"); ax.set_ylabel("Y [m]"); ax.set_zlabel("Z [m]")
+            ax.set_title(f"t={t}: err={info['err_norm']:.3e}")
+            ax.legend(); ax.view_init(elev=25, azim=45); plt.gca().set_box_aspect([1,1,1])
+            plt.pause(0.01)
+
+    if live_plot:
+        plt.ioff()
+        plt.show()
+
+    # report
     kp_hat = np.exp(ukf.x)
     print("Kp_true =", kp_true)
     print("Kp_hat  =", kp_hat)
     rel_err = np.linalg.norm(kp_hat - kp_true) / (np.linalg.norm(kp_true) + 1e-12)
     print("relative_error =", rel_err)
 
-    # visualize one step (final)
-    q_eq_demo = est.calc_equilibrium_s1(qdes_seq[-1], kp_hat)
-    est.visualize_compare(qdes_seq[-1], q_eq_demo, title="Equilibrium with UKF-estimated Kp")
+    # final snapshot figure
+    est.visualize_with_target(qdes_seq_ctrl[-1], qeq_seq[-1], T_des,
+                              title="Final: equilibrium meets target (with UKF-updated Kp)")
