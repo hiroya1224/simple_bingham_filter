@@ -395,13 +395,13 @@ if __name__ == "__main__":
     est_est  = SixRArm(urdf_path, tip_link_name="link6", base_link_name="base_link")  # filter/IK-only
 
     # Plant (unknown to estimator)
-    kp_true = np.array([18.0, 12.0, 14.0, 9.0, 7.0, 5.0], dtype=float)
+    kp_true = np.array([180.0, 120.0, 104.0, 90.0, 70.0, 50.0], dtype=float)
     g_base = np.array([0.0, 0.0, -9.8])
 
     # IKPy chain and reachable target by FK (once)
     chain = IkChain.from_urdf_file(urdf_path, base_elements=["base_link"], symbolic=False)
     model = est_true.model; data = est_true.data
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(6)
     q_ref = np.array([rng.uniform(lo, hi) for lo, hi in zip(model.lowerPositionLimit, model.upperPositionLimit)])
     pin.forwardKinematics(model, data, q_ref)
     jid = model.getJointId("joint6")
