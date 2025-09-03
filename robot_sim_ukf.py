@@ -379,8 +379,8 @@ if __name__ == "__main__":
     urdf_path = os.path.abspath("simple6r.urdf")
     est = SixRArmKpEstimator(urdf_path, tip_link_name="link6", base_link_name="base_link")
 
-    # ground-truth Kp* (simulator側)
-    kp_true = np.array([18.0, 12.0, 14.0, 9.0, 7.0, 5.0], dtype=float)
+    # ground-truth Kp*
+    kp_true = np.array([30.0, 30.0, 14.0, 9.0, 10.0, 5.0], dtype=float)
 
     # gravity in base
     g_base = np.array([0.0, 0.0, -9.8])
