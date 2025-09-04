@@ -356,9 +356,9 @@ class Visualizer:
         ax.plot(P_true[:,0],  P_true[:,1],  P_true[:,2],  "o-",  label="sim gravity (Kp_true)")
         ax.plot(P_est[:,0],   P_est[:,1],   P_est[:,2],   "o-.", label="est gravity (Kp_est)")
 
-        Ts_sim = robot_sim.joint_transforms(theta_cmd_final)
-        for Ti in Ts_sim:
-            self.draw_frame(ax, Ti, axis_len=0.06)
+        # Ts_sim = robot_sim.joint_transforms(theta_cmd_final)
+        # for Ti in Ts_sim:
+        #     self.draw_frame(ax, Ti, axis_len=0.06)
         self.draw_frame(ax, T_target_se3, axis_len=0.08)
 
         ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z"); ax.set_title(title); ax.legend()
