@@ -135,7 +135,7 @@ class RobotArm:
                     step_clip: float = 0.30,        # [rad] per iter per joint (S^1)
                     monotonic: bool = True,
                     # homotopy (always on)
-                    k_stiffness: float = 100.0,
+                    k_stiffness: float = 1000.0,
                     lambdas: Optional[np.ndarray] = None
                     ) -> np.ndarray:
         """
@@ -153,7 +153,7 @@ class RobotArm:
         n = self.nv
         K = np.diag(kp_vec)
         if lambdas is None:
-            lambdas = np.linspace(1.0, 0.0, 10)  # mandatory schedule
+            lambdas = np.linspace(1.0, 0.0, 100)  # mandatory schedule
 
         # helpers: S^1 representation and update
         def cs_from_q(q):
@@ -356,7 +356,6 @@ class AnalyticWeirdEKF:
 
     def update_with_L_quadratic(self, q_cmd: np.ndarray, A_t: np.ndarray,
                                 robot_est: RobotArm):
-        print(A_t)
         # Prior
         self.predict()
         # Analytic gradient/Hessian at current mean
@@ -437,10 +436,10 @@ if __name__ == "__main__":
     # Config
     rng = np.random.default_rng(3)
     g_base = np.array([0.0, 0.0, -9.81])
-    kp_true = np.array([4.0, 5.0, 4.0, 9.0, 5.0, 5.0], dtype=float) * 2
+    kp_true = np.array([4.0, 5.0, 4.0, 9.0, 5.0, 5.0], dtype=float) * 3
     parameter_A = 100.0
     n_segments = 2
-    densify = 100
+    densify = 200
     eps_def = 1e-3
 
     # 1) Two arms
@@ -458,7 +457,7 @@ if __name__ == "__main__":
 
     # 3) Init filter (log Kp prior)
     q_des = np.zeros(robot_est.nv)
-    x0 = np.log(np.ones(robot_est.nv) * 20.0)
+    x0 = np.log(np.ones(robot_est.nv) * 10.0)
     P0 = np.eye(robot_est.nv) * 1.0
     Q  = np.eye(robot_est.nv) * 1e-3
     wekf = AnalyticWeirdEKF(x0, P0, Q, eps_def=eps_def)
@@ -469,6 +468,8 @@ if __name__ == "__main__":
     key_rots = Rsc.from_quat(np.vstack([R0.as_quat(), R1.as_quat()]))
     slerp = Slerp([0.0, 1.0], key_rots)
     ts = np.linspace(0.0, 1.0, n_segments+1)[1:]
+    # ts = np.append(1 - np.exp(-5 * ts), [1.0])
+    print(ts)
     segment_targets = []
     for s in ts:
         p = (1-s)*T_start.translation + s*T_target_se3.translation
