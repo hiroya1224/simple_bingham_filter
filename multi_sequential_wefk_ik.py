@@ -17,6 +17,8 @@ from scipy.spatial.transform import Rotation as Rsc
 import matplotlib.pyplot as plt
 from ikpy.chain import Chain as IkChain
 
+from scipy.optimize import minimize
+
 
 # ------------------------ URDF utils ------------------------
 def require_urdf(urdf_path: str = "simple6r.urdf") -> str:
@@ -47,13 +49,13 @@ def _normalize(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 # ------------------------ Bingham helpers (NO normalization const) ------------------------
 class BinghamUtils:
     @staticmethod
-    def qmat_from_quat_wxyz(z: np.ndarray) -> np.ndarray:
-        w, x, y, zc = z
+    def qmat_from_quat_wxyz(q: np.ndarray) -> np.ndarray:
+        w, x, y, z = q
         return np.array(
             [
-                [-x, -y, -zc],
-                [w, -zc, y],
-                [zc, w, -x],
+                [-x, -y, -z],
+                [w, -z, y],
+                [z, w, -x],
                 [-y, x, w],
             ],
             dtype=float,
@@ -74,13 +76,13 @@ class BinghamUtils:
 
     @staticmethod
     def _rmat(q: np.ndarray) -> np.ndarray:
-        w, x, y, zc = q
+        w, x, y, z = q
         return np.array(
             [
-                [w, -x, -y, -zc],
-                [x, w, zc, -y],
-                [y, -zc, w, x],
-                [zc, y, -x, w],
+                [w, -x, -y, -z],
+                [x, w, z, -y],
+                [y, -z, w, x],
+                [z, y, -x, w],
             ],
             dtype=float,
         )
@@ -144,13 +146,16 @@ class RobotArm:
 
     def fk_pose(self, theta: np.ndarray) -> pin.SE3:
         self._fk_update(theta)
-        return self.data.oMf[self.tip_fid]
+        M = self.data.oMf[self.tip_fid]
+        # ディープコピー（参照を返さない）
+        return pin.SE3(M)  # これで内部バッファから独立
 
     def joint_transforms(self, theta: np.ndarray) -> List[pin.SE3]:
         self._fk_update(theta)
-        Ts = [self.data.oMi[jid] for jid in range(1, self.model.njoints)]
-        Ts.append(self.data.oMf[self.tip_fid])
+        Ts = [pin.SE3(self.data.oMi[jid]) for jid in range(1, self.model.njoints)]
+        Ts.append(pin.SE3(self.data.oMf[self.tip_fid]))
         return Ts
+
 
     # ---- Gravity & derivatives ----
     def tau_gravity(self, theta: np.ndarray) -> np.ndarray:
@@ -168,134 +173,153 @@ class RobotArm:
 # ------------------------ Equilibrium solver (S^1 Newton with homotopy) ------------------------
 @dataclass
 class EquilibriumConfig:
-    maxiter: int = 80
-    k_stiffness: float = 100.0
-    newton_mu0: float = 1e-2
-    newton_mu_max: float = 1e6
-    step_clip: float = 0.35
-    backtrack_max: int = 6
-    backtrack_shrink: float = 0.5
-    ensure_spd: bool = True
-    spd_boost: float = 1e-6
-    n_lambda: int = 10  # number of homotopy stages
-
+    maxiter: int = 200            # per lambda stage
+    k_stiffness: float = 100.0    # homotopy ridge
+    n_lambda: int = 10            # number of homotopy stages
+    ftol: float = 1e-9            # optimizer tolerance
+    verbose: bool = False         # SLSQP display
 
 class EquilibriumSolver:
     def __init__(self, cfg: Optional[EquilibriumConfig] = None) -> None:
         self.cfg = cfg or EquilibriumConfig()
         self.eq_path_last: List[np.ndarray] = []
 
+    # ---------- helpers (cos-sin parameterization) ----------
     @staticmethod
-    def _cs_from_theta(theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        return np.cos(theta), np.sin(theta)
+    def _pack_cs(c: np.ndarray, s: np.ndarray) -> np.ndarray:
+        # interleaved: [c0, s0, c1, s1, ...]
+        out = np.empty(c.size * 2, dtype=float)
+        out[0::2] = c
+        out[1::2] = s
+        return out
 
     @staticmethod
-    def _rotate_cs(c: np.ndarray, s: np.ndarray, dtheta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        cd = np.cos(dtheta)
-        sd = np.sin(dtheta)
-        c2 = c * cd - s * sd
-        s2 = s * cd + c * sd
-        nrm = np.sqrt(c2 * c2 + s2 * s2)
-        return c2 / nrm, s2 / nrm
+    def _unpack_cs(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        c = x[0::2]
+        s = x[1::2]
+        return c, s
 
     @staticmethod
     def _theta_from_cs(c: np.ndarray, s: np.ndarray) -> np.ndarray:
         return np.arctan2(s, c)
 
-    def _V_total(self, robot: RobotArm, theta: np.ndarray, theta_cmd: np.ndarray, K_eff: np.ndarray) -> float:
+    # ---------- objective & gradient in x = (c,s) ----------
+    @staticmethod
+    def _V_total(robot, theta: np.ndarray, theta_cmd: np.ndarray, k_eff_diag: np.ndarray) -> float:
+        # U(theta) + 1/2 * (theta - theta_cmd)^T K_eff (theta - theta_cmd)
+        U = robot.potential_gravity(theta)
         d = theta - theta_cmd
-        return robot.potential_gravity(theta) + 0.5 * float(d.T @ (K_eff @ d))
+        return float(U + 0.5 * np.dot(d * k_eff_diag, d))
 
-    def _newton_step(
-        self,
-        robot: RobotArm,
-        theta_cmd: np.ndarray,
-        K_eff: np.ndarray,
-        c: np.ndarray,
-        s: np.ndarray,
-        mu: float,
-        ensure_spd: bool,
-        spd_boost: float,
-        step_clip: float,
-        backtrack_max: int,
-        backtrack_shrink: float,
-    ) -> Tuple[np.ndarray, np.ndarray, float]:
-        theta = self._theta_from_cs(c, s)
-
+    @staticmethod
+    def _grad_theta(robot, theta: np.ndarray, theta_cmd: np.ndarray, k_eff_diag: np.ndarray) -> np.ndarray:
+        # ∂V/∂theta = tau_g(theta) + K_eff (theta - theta_cmd)
         tau_g = robot.tau_gravity(theta)
-        F = tau_g + K_eff @ (theta - theta_cmd)
+        return tau_g + k_eff_diag * (theta - theta_cmd)
 
-        dG = robot.d_tau_gravity(theta)
-        Jq = dG + K_eff
-        if ensure_spd:
-            Jq = 0.5 * (Jq + Jq.T) + spd_boost * np.eye(Jq.shape[0])
+    @staticmethod
+    def _grad_x_from_grad_theta(g_theta: np.ndarray, c: np.ndarray, s: np.ndarray) -> np.ndarray:
+        # theta_i = atan2(s_i, c_i)
+        # dtheta/dc = -s / (c^2 + s^2), dtheta/ds =  c / (c^2 + s^2)
+        denom = np.maximum(c * c + s * s, 1e-12)
+        dtheta_dc = -s / denom
+        dtheta_ds =  c / denom
+        gx = np.empty(g_theta.size * 2, dtype=float)
+        gx[0::2] = g_theta * dtheta_dc
+        gx[1::2] = g_theta * dtheta_ds
+        return gx
 
-        A = Jq + mu * np.eye(Jq.shape[0])
-        dtheta = -(np.linalg.pinv(A, rcond=1e-12) @ F)
-        dtheta = np.clip(dtheta, -step_clip, step_clip)
+    # ---------- constraints c_i^2 + s_i^2 = 1 ----------
+    @staticmethod
+    def _cons_fun(x: np.ndarray) -> np.ndarray:
+        c, s = EquilibriumSolver._unpack_cs(x)
+        return c * c + s * s - 1.0
 
-        V_cur = self._V_total(robot, theta, theta_cmd, K_eff)
-        accept = False
-        dtheta_try = dtheta.copy()
+    @staticmethod
+    def _cons_jac(x: np.ndarray) -> np.ndarray:
+        c, s = EquilibriumSolver._unpack_cs(x)
+        n = c.size
+        J = np.zeros((n, 2 * n), dtype=float)
+        idx = np.arange(n)
+        J[idx, 2 * idx] = 2.0 * c
+        J[idx, 2 * idx + 1] = 2.0 * s
+        return J
 
-        for _ in range(backtrack_max):
-            c_try, s_try = self._rotate_cs(c, s, dtheta_try)
-            theta_try = self._theta_from_cs(c_try, s_try)
-            V_try = self._V_total(robot, theta_try, theta_cmd, K_eff)
-            if V_try <= V_cur:
-                c, s = c_try, s_try
-                accept = True
-                break
-            dtheta_try *= backtrack_shrink
+    def _stage_minimize(
+        self,
+        robot,
+        theta_cmd: np.ndarray,
+        k_eff_diag: np.ndarray,
+        x0: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        One SLSQP solve for fixed K_eff (one homotopy stage).
+        Returns (x_opt, theta_opt).
+        """
+        def f_obj(x: np.ndarray) -> float:
+            c, s = self._unpack_cs(x)
+            theta = self._theta_from_cs(c, s)
+            return self._V_total(robot, theta, theta_cmd, k_eff_diag)
 
-        if accept:
-            mu_new = max(self.cfg.newton_mu0, mu * 0.33)
-        else:
-            mu_new = min(self.cfg.newton_mu_max, mu * 3.0)
+        def f_jac(x: np.ndarray) -> np.ndarray:
+            c, s = self._unpack_cs(x)
+            theta = self._theta_from_cs(c, s)
+            g_theta = self._grad_theta(robot, theta, theta_cmd, k_eff_diag)
+            return self._grad_x_from_grad_theta(g_theta, c, s)
 
-        return c, s, mu_new
+        cons = {
+            "type": "eq",
+            "fun": self._cons_fun,
+            "jac": self._cons_jac,
+        }
+
+        res = minimize(
+            fun=f_obj,
+            x0=x0,
+            jac=f_jac,
+            constraints=[cons],
+            method="SLSQP",
+            options={
+                "maxiter": int(self.cfg.maxiter),
+                "ftol": float(self.cfg.ftol),
+                "disp": bool(self.cfg.verbose),
+            },
+        )
+        x_opt = res.x
+        c_opt, s_opt = self._unpack_cs(x_opt)
+        theta_opt = self._theta_from_cs(c_opt, s_opt)
+        return x_opt, theta_opt
 
     def solve(
         self,
-        robot: RobotArm,
+        robot,
         theta_cmd: np.ndarray,
         kp_vec: np.ndarray,
         theta_init: Optional[np.ndarray] = None,
         lambdas: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        cfg = self.cfg
+        """
+        Homotopy over lambda in [1 -> 0]. Each stage solves:
+            min_{c,s} U(theta(c,s)) + 1/2 (theta - theta_cmd)^T K_eff(theta - theta_cmd)
+            s.t. c_i^2 + s_i^2 = 1
+        """
         if lambdas is None:
-            lambdas = np.linspace(1.0, 0.0, cfg.n_lambda)
+            lambdas = np.linspace(1.0, 0.0, self.cfg.n_lambda)
 
-        n = robot.nv
-        K = np.diag(kp_vec)
+        n = kp_vec.size
         theta0 = theta_init.copy() if theta_init is not None else theta_cmd.copy()
-        it_per_stage = max(1, int(np.ceil(cfg.maxiter / max(1, len(lambdas)))))
+        c0 = np.cos(theta0)
+        s0 = np.sin(theta0)
+        x0 = self._pack_cs(c0, s0)
 
         self.eq_path_last = []
-        c, s = self._cs_from_theta(theta0)
-        mu = float(cfg.newton_mu0)
 
         for lam in lambdas:
-            K_eff = K + (lam * cfg.k_stiffness) * np.eye(n)
-            for _ in range(it_per_stage):
-                c, s, mu = self._newton_step(
-                    robot=robot,
-                    theta_cmd=theta_cmd,
-                    K_eff=K_eff,
-                    c=c,
-                    s=s,
-                    mu=mu,
-                    ensure_spd=cfg.ensure_spd,
-                    spd_boost=cfg.spd_boost,
-                    step_clip=cfg.step_clip,
-                    backtrack_max=cfg.backtrack_max,
-                    backtrack_shrink=cfg.backtrack_shrink,
-                )
-            self.eq_path_last.append(self._theta_from_cs(c, s).copy())
+            k_eff_diag = kp_vec + float(lam) * float(self.cfg.k_stiffness)
+            x0, theta_opt = self._stage_minimize(robot, theta_cmd, k_eff_diag, x0)
+            self.eq_path_last.append(theta_opt.copy())
 
-        return self._theta_from_cs(c, s)
-
+        return theta_opt
 
 # ------------------------ RIK / GaIK ------------------------
 class RikGaikPlanner:
@@ -569,14 +593,14 @@ class Visualizer:
 
 # ------------------------ Main (example) ------------------------
 if __name__ == "__main__":
-    rng = np.random.default_rng(3)
+    rng = np.random.default_rng(9)
     g_base = np.array([0.0, 0.0, -9.81], dtype=float)
-    kp_true = np.array([18.0, 12.0, 14.0, 9.0, 7.0, 5.0], dtype=float)
+    kp_true = np.array([18.0, 12.0, 14.0, 9.0, 7.0, 5.0], dtype=float) * 2
     parameter_A = 100.0
     n_ref_steps = 50  # linear interpolation steps along theta_ref
 
     # Choose which link frames to use for gravity-direction likelihood
-    obs_frames = ["link6", "link3", "link2"]  # <- add/remove names as needed
+    obs_frames = ["link6", "link3", "link4"]  # <- add/remove names as needed
 
     # Two arms + IKPy chain
     urdf_path = require_urdf("simple6r.urdf")
