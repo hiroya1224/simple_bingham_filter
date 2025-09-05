@@ -1,14 +1,14 @@
-# RIK→θ_ref path, GaIK(逆静力学)→θ_cmd path, analytic Weird EKF on log Kp
-# - Two arms (robot_sim: truth, robot_est: estimation), same URDF
-# - Target SE(3) is fixed beforehand by robot_sim (never moved)
-# - IK: always IKPy (rigid)
-# - S^1 equilibrium solver: mandatory homotopy (lambda=linspace(1,0,10), k_stiffness=100), no early break
+# RIK(one-shot) → linear interp θ_ref path → GaIK(inverse statics) → analytic Weird EKF
+# - RIK: IKPyで T_target を一発で解き θ_ref_goal を得る
+# - θ_ref_path は θ_init から θ_ref_goal の線形補間のみ（ウェイポイントでIKは解かない）
+# - GaIK: θ_cmd = θ_ref + K^{-1} τ_g(θ_ref)
+# - Equilibrium solver: energy-minimizing S^1 Newton with mandatory homotopy (lambda linspace 1->0)
 # - All linear algebra uses pinv (no solve/inv)
 
 import os
 import numpy as np
 import pinocchio as pin
-from scipy.spatial.transform import Rotation as Rsc, Slerp
+from scipy.spatial.transform import Rotation as Rsc
 import matplotlib.pyplot as plt
 from typing import Optional, Tuple, List
 from ikpy.chain import Chain as IkChain
@@ -46,7 +46,7 @@ def ensure_urdf() -> str:
     <origin xyz="0 0 0.18" rpy="0 0 0"/><axis xyz="0 1 0"/>
     <limit lower="-3.1416" upper="3.1416" effort="60" velocity="3.0"/>
   </joint>
-  <joint name="joint6" type="revololute">
+  <joint name="joint6" type="revolute">
     <parent link="link5"/><child link="link6"/>
     <origin xyz="0 0 0.12" rpy="0 0 0"/><axis xyz="1 0 0"/>
     <limit lower="-3.1416" upper="3.1416" effort="40" velocity="3.5"/>
@@ -80,7 +80,11 @@ def se3_to_homog(M: pin.SE3) -> np.ndarray:
     T = np.eye(4); T[:3,:3] = M.rotation; T[:3,3] = M.translation
     return T
 
-# ------------------------ Bingham helpers (NO normalization) ------------------------
+def make_theta_path(theta0: np.ndarray, theta1: np.ndarray, n: int) -> np.ndarray:
+    a = np.linspace(0.0, 1.0, n)
+    return (1-a)[:,None]*theta0[None,:] + a[:,None]*theta1[None,:]
+
+# ------------------------ Bingham helpers ------------------------
 def Q_from_quat_wxyz(z: np.ndarray) -> np.ndarray:
     w, x, y, zc = z
     return np.array([
@@ -102,7 +106,7 @@ def simple_bingham_unit(before_vec3: np.ndarray, after_vec3: np.ndarray, paramet
         w,x,y,z = q
         return np.array([[w,-x,-y,-z],[x,w,z,-y],[y,-z,w,x],[z,y,-x,w]])
     P = Lmat(xq) - Rmat(vq)
-    A0 = -0.25*(P.T @ P)  # semi-negative definite
+    A0 = -0.25*(P.T @ P)
     return float(parameter)*A0
 
 # ------------------------ Robot wrapper ------------------------
@@ -115,54 +119,35 @@ class RobotArm:
         self.base_fid = self.model.getFrameId(base_link)
         if hasattr(self.model, "gravity"):
             self.model.gravity.linear = np.array([0.0, 0.0, -9.81])
-        # total mass for potential energy: U = - M * g^T * com(q)
         self.total_mass = sum(inert.mass for inert in self.model.inertias)
-        self.eq_path_last = []
+        self.eq_path_last: List[np.ndarray] = []
 
+    # ---- Energy-minimizing S^1 Newton with mandatory homotopy (pinv only) ----
     def equilibrium_s1(self, theta_cmd: np.ndarray, kp_vec: np.ndarray,
-                    maxiter: int = 80, eps: float = 1e-10,
-                    theta_init: Optional[np.ndarray] = None,
-                    k_stiffness: float = 100.0,
-                    lambdas: Optional[np.ndarray] = None,
-                    newton_mu0: float = 1e-2, newton_mu_max: float = 1e6,
-                    step_clip: float = 0.35,    # [rad] per joint
-                    backtrack_max: int = 6,     # line search trials
-                    backtrack_shrink: float = 0.5,
-                    ensure_spd: bool = True, spd_boost: float = 1e-6
-                    ) -> np.ndarray:
-        """
-        Solve argmin_q V(q) on S^1 with mandatory homotopy:
-        V(q) = U_grav(q) + 0.5*(q-theta_cmd)^T K_eff (q-theta_cmd),
-        K_eff = K + lambda * k_stiffness * I, lambda in linspace(1,0,10)
-        Newton step on V: (J_q + mu I) * dq = -F, with backtracking to enforce V decrease.
-        - Update is performed on S^1 via per-joint rotation of (cos,sin) by dq.
-        - No early break; runs full homotopy schedule.
-        """
+                       maxiter: int = 80, theta_init: Optional[np.ndarray] = None,
+                       k_stiffness: float = 100.0,
+                       lambdas: Optional[np.ndarray] = None,
+                       newton_mu0: float = 1e-2, newton_mu_max: float = 1e6,
+                       step_clip: float = 0.35, backtrack_max: int = 6,
+                       backtrack_shrink: float = 0.5,
+                       ensure_spd: bool = True, spd_boost: float = 1e-6) -> np.ndarray:
         if lambdas is None:
             lambdas = np.linspace(1.0, 0.0, 10)
         n = self.nv
         K = np.diag(kp_vec)
         theta0 = theta_init.copy() if theta_init is not None else theta_cmd.copy()
 
-        # S^1 helpers
-        def cs_from_theta(th):
-            return np.cos(th), np.sin(th)
+        def cs_from_theta(th): return np.cos(th), np.sin(th)
         def rotate_cs(c, s, dth):
             cd, sd = np.cos(dth), np.sin(dth)
-            c2 = c*cd - s*sd
-            s2 = s*cd + c*sd
-            nrm = np.sqrt(c2*c2 + s2*s2)
-            return c2/nrm, s2/nrm
-        def theta_from_cs(c, s):
-            return np.arctan2(s, c)
+            c2 = c*cd - s*sd; s2 = s*cd + c*sd
+            nrm = np.sqrt(c2*c2 + s2*s2); return c2/nrm, s2/nrm
+        def theta_from_cs(c, s): return np.arctan2(s, c)
 
-        # gravitational potential: U = - M * g^T * com(q)
         def U_grav(th):
-            # center of mass in WORLD; pin sets data.com[0]
             com = pin.centerOfMass(self.model, self.data, th)
             g = self.model.gravity.linear
             return - float(self.total_mass) * float(np.dot(g, com))
-
         def V_total(th, K_eff):
             d = th - theta_cmd
             return U_grav(th) + 0.5 * float(d.T @ (K_eff @ d))
@@ -174,47 +159,32 @@ class RobotArm:
         for lam in lambdas:
             K_eff = K + (lam * k_stiffness) * np.eye(n)
             mu = float(newton_mu0)
-
             for _ in range(it_per_stage):
                 th = theta_from_cs(c, s)
-                # grad V = F, hess V = J_q
                 tau_g = pin.computeGeneralizedGravity(self.model, self.data, th)
                 F = tau_g + K_eff @ (th - theta_cmd)
                 dG = pin.computeGeneralizedGravityDerivatives(self.model, self.data, th)
                 Jq = dG + K_eff
-                if ensure_spd:
-                    # make symmetric positive-definite-ish for Newton on V
-                    Jq = 0.5*(Jq + Jq.T) + spd_boost * np.eye(n)
+                if ensure_spd: Jq = 0.5*(Jq + Jq.T) + spd_boost * np.eye(n)
 
-                # damped Newton on V: (Jq + mu I) dq = -F   (pinv only)
                 A = Jq + mu * np.eye(n)
-                dq_newton = - (np.linalg.pinv(A, rcond=1e-12) @ F)
-                # trust-region clip
-                dq_newton = np.clip(dq_newton, -step_clip, step_clip)
+                dth_newton = - (np.linalg.pinv(A, rcond=1e-12) @ F)
+                dth_newton = np.clip(dth_newton, -step_clip, step_clip)
 
-                # backtracking on V
                 V_cur = V_total(th, K_eff)
-                accept = False
-                dq_try = dq_newton.copy()
+                accept = False; dth_try = dth_newton.copy()
                 for _bt in range(backtrack_max):
-                    c_try, s_try = rotate_cs(c, s, dq_try)
+                    c_try, s_try = rotate_cs(c, s, dth_try)
                     th_try = theta_from_cs(c_try, s_try)
                     V_try = V_total(th_try, K_eff)
-                    if V_try <= V_cur:  # monotone in energy
-                        accept = True
-                        break
-                    dq_try *= backtrack_shrink
-                if accept:
-                    c, s = c_try, s_try
-                    mu = max(newton_mu0, mu * 0.33)
-                else:
-                    # reject but still continue; increase damping for next step
-                    mu = min(newton_mu_max, mu * 3.0)
+                    if V_try <= V_cur: accept = True; break
+                    dth_try *= backtrack_shrink
+                if accept: c, s = c_try, s_try; mu = max(newton_mu0, mu*0.33)
+                else:      mu = min(newton_mu_max, mu*3.0)
 
             self.eq_path_last.append(theta_from_cs(c, s).copy())
 
-        theta_fin = theta_from_cs(c, s)
-        return theta_fin
+        return theta_from_cs(c, s)
 
     # kinematics helpers
     def ee_rotation_in_base(self, theta: np.ndarray) -> np.ndarray:
@@ -251,24 +221,17 @@ class RobotArm:
         Ts.append(self.data.oMf[self.tip_fid])
         return Ts
 
-# ------------------------ IK (RIK) ------------------------
-def rik_path_from_targets(chain: IkChain, T_list: List[pin.SE3],
-                          theta_seed: np.ndarray, max_iter: int = 1200) -> np.ndarray:
-    thetas = []
-    theta_prev = theta_seed.copy()
-    for T in T_list:
-        T_h = se3_to_homog(T)
-        q0_full = np.zeros(len(chain.links))
-        q0_full[1:1+theta_prev.size] = theta_prev
-        sol_full = chain.inverse_kinematics_frame(
-            T_h, initial_position=q0_full, max_iter=max_iter, orientation_mode="all"
-        )
-        theta_ref = np.array(sol_full[1:1+theta_prev.size])
-        thetas.append(theta_ref)
-        theta_prev = theta_ref
-    return np.vstack(thetas)
+# ------------------------ IK (RIK: one-shot to target) ------------------------
+def rik_solve(chain: IkChain, T_target: pin.SE3, theta_init: np.ndarray, max_iter: int = 1200) -> np.ndarray:
+    T_h = se3_to_homog(T_target)
+    q0_full = np.zeros(len(chain.links))
+    q0_full[1:1+theta_init.size] = theta_init
+    sol_full = chain.inverse_kinematics_frame(
+        T_h, initial_position=q0_full, max_iter=max_iter, orientation_mode="all"
+    )
+    return np.array(sol_full[1:1+theta_init.size])
 
-# ------------------------ GaIK (inverse statics one-shot) ------------------------
+# ------------------------ GaIK (inverse statics) ------------------------
 def theta_cmd_from_theta_ref(robot: RobotArm, theta_ref: np.ndarray, kp_vec: np.ndarray) -> np.ndarray:
     tau_g = pin.computeGeneralizedGravity(robot.model, robot.data, theta_ref)
     return theta_ref + tau_g / np.maximum(kp_vec, 1e-12)
@@ -285,9 +248,7 @@ def build_A_from_true(robot_sim: RobotArm, theta_cmd: np.ndarray, kp_true: np.nd
 # ------------------------ Analytic Weird EKF (pinv-only) ------------------------
 class AnalyticWeirdEKF:
     def __init__(self, x0: np.ndarray, P0: np.ndarray, Q: np.ndarray, eps_def: float = 1e-6):
-        self.x = x0.copy()   # mean of log Kp
-        self.P = P0.copy()
-        self.Q = Q.copy()
+        self.x = x0.copy(); self.P = P0.copy(); self.Q = Q.copy()
         self.eps_def = float(eps_def)
 
     def predict(self):
@@ -296,40 +257,33 @@ class AnalyticWeirdEKF:
     def _grad_hess_analytic(self, x0: np.ndarray, theta_cmd: np.ndarray, A_t: np.ndarray,
                             robot_est: RobotArm, theta_init: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
         n = x0.size
-        k = np.exp(x0)
-        K = np.diag(k)
-        # equilibrium at current mean, warm-start with predicted or theta_ref
-        theta_eq = robot_est.equilibrium_s1(theta_cmd, k, maxiter=80, theta_init=theta_init)
+        k = np.exp(x0); K = np.diag(k)
+        theta_equil = robot_est.equilibrium_s1(theta_cmd, k, maxiter=80, theta_init=theta_init)
 
-        dG = pin.computeGeneralizedGravityDerivatives(robot_est.model, robot_est.data, theta_eq)  # (n x n)
+        dG = pin.computeGeneralizedGravityDerivatives(robot_est.model, robot_est.data, theta_equil)
         J_q = dG + K
-        J_x = np.diag(k * (theta_eq - theta_cmd))
-        J_w = robot_est.frame_angular_jacobian_world(theta_eq)  # (3 x n)
-        z = robot_est.ee_quaternion_wxyz_base(theta_eq)         # (4,)
-        Qz = Q_from_quat_wxyz(z)                                # (4 x 3)
+        J_x = np.diag(k * (theta_equil - theta_cmd))
+        J_w = robot_est.frame_angular_jacobian_world(theta_equil)
+        z = robot_est.ee_quaternion_wxyz_base(theta_equil)
+        Qz = Q_from_quat_wxyz(z)
 
-        # gradient g = - J_x^T J_q^{-T} J_w^T Q^T A z
-        v = Qz.T @ (A_t @ z)                   # (3,)
-        u = J_w.T @ v                          # (n,)
+        v = Qz.T @ (A_t @ z)
+        u = J_w.T @ v
         y = np.linalg.pinv(J_q.T, rcond=1e-12) @ u
-        g = - (J_x.T @ y)                      # (n,)
+        g = - (J_x.T @ y)
 
-        # Hessian H0 = 1/2 * M^T A M,  M = Q J_w J_q^{-1} J_x
-        X = np.linalg.pinv(J_q, rcond=1e-12) @ J_x   # (n x n)
-        M = Qz @ (J_w @ X)                            # (4 x n)
+        X = np.linalg.pinv(J_q, rcond=1e-12) @ J_x
+        M = Qz @ (J_w @ X)
         H0 = 0.5 * (M.T @ (A_t @ M))
         MtM = M.T @ M
 
-        # Bingham invariance: shift by c*I_4 ⇒ H = H0 + 1/2 c MtM, choose c ≤ 0 s.t. -H ≻ 0
         H0s = 0.5*(H0 + H0.T)
-        wH = np.linalg.eigvalsh(H0s)
-        lam_max_H = float(np.max(wH)) if wH.size > 0 else 0.0
+        wH = np.linalg.eigvalsh(H0s); lam_max_H = float(np.max(wH)) if wH.size>0 else 0.0
         if lam_max_H <= -self.eps_def:
             H = H0s
         else:
-            Bs = 0.5*(MtM + MtM.T)
-            wB = np.linalg.eigvalsh(Bs)
-            lam_max_B = float(np.max(wB)) if wB.size > 0 else 0.0
+            Bs = 0.5*(MtM + MtM.T); wB = np.linalg.eigvalsh(Bs)
+            lam_max_B = float(np.max(wB)) if wB.size>0 else 0.0
             if lam_max_B <= 1e-12:
                 H = H0s - (lam_max_H + self.eps_def) * np.eye(n)
             else:
@@ -341,10 +295,8 @@ class AnalyticWeirdEKF:
                                 robot_est: RobotArm, theta_init_eq_pred: Optional[np.ndarray]):
         self.predict()
         g, H = self._grad_hess_analytic(self.x, theta_cmd, A_t, robot_est, theta_init_eq_pred)
-        Sinv = -H  # precision of pseudo-observation
-        # ensure PD by minimal diagonal boost if needed (pinv-friendly)
-        w = np.linalg.eigvalsh(0.5*(Sinv+Sinv.T))
-        lam_min = float(np.min(w))
+        Sinv = -H
+        w = np.linalg.eigvalsh(0.5*(Sinv+Sinv.T)); lam_min = float(np.min(w))
         if lam_min <= self.eps_def:
             Sinv = Sinv + ((self.eps_def - lam_min) + 1e-12) * np.eye(Sinv.shape[0])
         S = np.linalg.pinv(Sinv, rcond=1e-12)
@@ -392,12 +344,8 @@ class Visualizer:
         ax.plot(P_rigid[:,0], P_rigid[:,1], P_rigid[:,2], "o--", label="sim rigid (theta_cmd)")
         ax.plot(P_true[:,0],  P_true[:,1],  P_true[:,2],  "o-",  label="sim gravity (Kp_true)")
         ax.plot(P_est[:,0],   P_est[:,1],   P_est[:,2],   "o-.", label="est gravity (Kp_est)")
-
-        # Ts_sim = robot_sim.joint_transforms(theta_cmd_final)
-        # for Ti in Ts_sim:
-        #     self.draw_frame(ax, Ti, axis_len=0.06)
+        # for Ti in robot_sim.joint_transforms(theta_cmd_final): self.draw_frame(ax, Ti, axis_len=0.06)
         self.draw_frame(ax, T_target_se3, axis_len=0.08)
-
         ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z"); ax.set_title(title); ax.legend()
         all_pts = np.vstack([P_rigid, P_true, P_est, T_target_se3.translation.reshape(1,3)])
         c = all_pts.mean(axis=0); r = max(np.max(np.linalg.norm(all_pts-c, axis=1)), 0.25)
@@ -406,11 +354,11 @@ class Visualizer:
 
 # ------------------------ Main ------------------------
 if __name__ == "__main__":
-    rng = np.random.default_rng(8)
+    rng = np.random.default_rng(14)
     g_base = np.array([0.0, 0.0, -9.81])
     kp_true = np.array([18.0, 12.0, 14.0, 9.0, 7.0, 5.0], dtype=float)
     parameter_A = 100.0
-    n_waypoints = 60
+    n_ref_steps = 60  # linear interpolation steps from theta_init to theta_ref_goal
 
     # Two arms + IKPy chain
     urdf_path = ensure_urdf()
@@ -418,67 +366,57 @@ if __name__ == "__main__":
     robot_est = RobotArm(urdf_path, tip_link="link6", base_link="base_link")
     chain = IkChain.from_urdf_file(urdf_path, base_elements=["base_link"], symbolic=False)
 
-    # Fixed target (built before estimation on robot_sim)
+    # Fixed target (made with robot_sim before estimation)
     theta_rand = np.array([rng.uniform(lo, hi)
                            for lo, hi in zip(robot_sim.model.lowerPositionLimit,
                                              robot_sim.model.upperPositionLimit)])
     theta_equil_true_for_target = robot_sim.equilibrium_s1(theta_rand, kp_true, maxiter=80, theta_init=theta_rand)
     T_target_se3 = robot_sim.fk_pose(theta_equil_true_for_target)
 
-    # Build SE(3) waypoint list from start pose to target
-    theta_seed = np.zeros(robot_est.nv)
-    theta_equil_seed = robot_est.equilibrium_s1(theta_seed, np.ones(robot_est.nv)*25.0, maxiter=60, theta_init=theta_seed)
-    T_start = robot_est.fk_pose(theta_equil_seed)
-    R0 = Rsc.from_matrix(T_start.rotation); R1 = Rsc.from_matrix(T_target_se3.rotation)
-    slerp = Slerp([0.0, 1.0], Rsc.from_quat(np.vstack([R0.as_quat(), R1.as_quat()])))
-    T_list = []
-    for s in np.linspace(0.0, 1.0, n_waypoints):
-        p = (1-s)*T_start.translation + s*T_target_se3.translation
-        Rm = slerp([s]).as_matrix()[0]
-        T_list.append(pin.SE3(Rm, p))
+    # RIK (one-shot): solve final θ_ref_goal once, then linearly interpolate from theta_init
+    theta_init = np.zeros(robot_est.nv)
+    theta_ref_goal = rik_solve(chain, T_target_se3, theta_init, max_iter=1200)
+    theta_ref_path = make_theta_path(theta_init, theta_ref_goal, n_ref_steps)
 
-    # RIK: θ_ref path
-    theta_ref_path = rik_path_from_targets(chain, T_list, theta_seed, max_iter=1200)
-
-    # Weird EKF init (log Kp)
+    # Weird EKF init
     x0 = np.log(np.ones(robot_est.nv) * 25.0)
     P0 = np.eye(robot_est.nv) * 1.0
     Q  = np.eye(robot_est.nv) * 1e-3
     wekf = AnalyticWeirdEKF(x0, P0, Q, eps_def=1e-6)
 
-    # Loop over θ_ref path → θ_cmd → A_t → EKF update
+    # Loop over θ_ref_path → θ_cmd → A_t → EKF update
     theta_ws_true = None
-    theta_ws_est_pred = None
     theta_cmd_final = None
+    theta_equil_pred_prev = None
     for k in range(theta_ref_path.shape[0]):
         theta_ref_k = theta_ref_path[k]
         kp_hat = np.exp(wekf.x)
 
-        # GaIK (inverse statics): θ_cmd from θ_ref
+        # GaIK: inverse statics one-shot
         theta_cmd_k = theta_cmd_from_theta_ref(robot_est, theta_ref_k, kp_hat)
         theta_cmd_final = theta_cmd_k
 
-        # Build observation A_t on robot_sim using θ_cmd_k
+        # observation A_t from robot_sim using theta_cmd_k
         A_t, theta_equil_true_k = build_A_from_true(robot_sim, theta_cmd_k, kp_true, g_base,
                                                     parameter_A=parameter_A, newton_iter_true=60,
                                                     theta_ws_true=theta_ws_true)
         theta_ws_true = theta_equil_true_k
 
-        # Predicted equilibrium on robot_est (warm-start with θ_ref_k)
-        theta_equil_pred_k = robot_est.equilibrium_s1(theta_cmd_k, kp_hat, maxiter=80, theta_init=theta_ref_k)
-        theta_ws_est_pred = theta_equil_pred_k
+        # predicted equilibrium (warm-start with theta_ref_k or previous predicted)
+        theta_equil_pred_k = robot_est.equilibrium_s1(theta_cmd_k, kp_hat, maxiter=80,
+                                                      theta_init=(theta_equil_pred_prev if theta_equil_pred_prev is not None else theta_ref_k))
+        theta_equil_pred_prev = theta_equil_pred_k
 
-        # Weird EKF update (pinv-only), using θ_cmd and warm-start
+        # Weird EKF update
         wekf.update_with_L_quadratic(theta_cmd_k, A_t, robot_est, theta_init_eq_pred=theta_equil_pred_k)
 
-        # (optional) print progress
-        if (k+1) % max(1, n_waypoints//4) == 0:
-            print(f"[{k+1}/{n_waypoints}] Kp_hat =", np.exp(wekf.x))
+        if (k+1) % max(1, n_ref_steps//4) == 0:
+            print(f"[{k+1}/{n_ref_steps}] Kp_hat =", np.exp(wekf.x))
 
     # Visualization & report
     viz = Visualizer()
     viz.show_triplet(robot_sim, robot_est, theta_cmd_final, kp_true, np.maximum(np.exp(wekf.x),1e-8),
-                     T_target_se3, title="Triplet: rigid vs true-gravity vs est-gravity (RIK→GaIK)")
+                     T_target_se3, title="Triplet: rigid vs true-gravity vs est-gravity (RIK one-shot → linear ref path)")
 
     theta_equil_true_final = robot_sim.equilibrium_s1(theta_cmd_final, kp_true, maxiter=80, theta_init=theta_cmd_final)
     E_final = robot_sim.fk_pose(theta_equil_true_final).inverse() * T_target_se3
