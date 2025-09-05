@@ -115,22 +115,36 @@ class RobotArm:
         self.base_fid = self.model.getFrameId(base_link)
         if hasattr(self.model, "gravity"):
             self.model.gravity.linear = np.array([0.0, 0.0, -9.81])
-        self.eq_path_last: List[np.ndarray] = []
+        # total mass for potential energy: U = - M * g^T * com(q)
+        self.total_mass = sum(inert.mass for inert in self.model.inertias)
+        self.eq_path_last = []
 
-    # --- mandatory-homotopy S^1-LM equilibrium (no early break) ---
     def equilibrium_s1(self, theta_cmd: np.ndarray, kp_vec: np.ndarray,
-                       maxiter: int = 80, eps: float = 1e-10,
-                       theta_init: Optional[np.ndarray] = None,
-                       lm_mu0: float = 1e-1, lm_mu_max: float = 1e8,
-                       step_clip: float = 0.30, monotonic: bool = True,
-                       k_stiffness: float = 100.0,
-                       lambdas: Optional[np.ndarray] = None) -> np.ndarray:
+                    maxiter: int = 80, eps: float = 1e-10,
+                    theta_init: Optional[np.ndarray] = None,
+                    k_stiffness: float = 100.0,
+                    lambdas: Optional[np.ndarray] = None,
+                    newton_mu0: float = 1e-2, newton_mu_max: float = 1e6,
+                    step_clip: float = 0.35,    # [rad] per joint
+                    backtrack_max: int = 6,     # line search trials
+                    backtrack_shrink: float = 0.5,
+                    ensure_spd: bool = True, spd_boost: float = 1e-6
+                    ) -> np.ndarray:
+        """
+        Solve argmin_q V(q) on S^1 with mandatory homotopy:
+        V(q) = U_grav(q) + 0.5*(q-theta_cmd)^T K_eff (q-theta_cmd),
+        K_eff = K + lambda * k_stiffness * I, lambda in linspace(1,0,10)
+        Newton step on V: (J_q + mu I) * dq = -F, with backtracking to enforce V decrease.
+        - Update is performed on S^1 via per-joint rotation of (cos,sin) by dq.
+        - No early break; runs full homotopy schedule.
+        """
         if lambdas is None:
             lambdas = np.linspace(1.0, 0.0, 10)
         n = self.nv
         K = np.diag(kp_vec)
         theta0 = theta_init.copy() if theta_init is not None else theta_cmd.copy()
 
+        # S^1 helpers
         def cs_from_theta(th):
             return np.cos(th), np.sin(th)
         def rotate_cs(c, s, dth):
@@ -142,37 +156,60 @@ class RobotArm:
         def theta_from_cs(c, s):
             return np.arctan2(s, c)
 
+        # gravitational potential: U = - M * g^T * com(q)
+        def U_grav(th):
+            # center of mass in WORLD; pin sets data.com[0]
+            com = pin.centerOfMass(self.model, self.data, th)
+            g = self.model.gravity.linear
+            return - float(self.total_mass) * float(np.dot(g, com))
+
+        def V_total(th, K_eff):
+            d = th - theta_cmd
+            return U_grav(th) + 0.5 * float(d.T @ (K_eff @ d))
+
         it_per_stage = max(1, int(np.ceil(maxiter / max(1, len(lambdas)))))
         self.eq_path_last = []
         c, s = cs_from_theta(theta0)
 
         for lam in lambdas:
             K_eff = K + (lam * k_stiffness) * np.eye(n)
-            mu = float(lm_mu0)
+            mu = float(newton_mu0)
+
             for _ in range(it_per_stage):
                 th = theta_from_cs(c, s)
+                # grad V = F, hess V = J_q
                 tau_g = pin.computeGeneralizedGravity(self.model, self.data, th)
                 F = tau_g + K_eff @ (th - theta_cmd)
-
                 dG = pin.computeGeneralizedGravityDerivatives(self.model, self.data, th)
                 Jq = dG + K_eff
+                if ensure_spd:
+                    # make symmetric positive-definite-ish for Newton on V
+                    Jq = 0.5*(Jq + Jq.T) + spd_boost * np.eye(n)
 
-                JT = Jq.T
-                A = JT @ Jq + mu * np.eye(n)
-                b = - JT @ F
-                # pinv-based LM step
-                dq = np.linalg.pinv(A, rcond=1e-12) @ b
-                dq = np.clip(dq, -step_clip, step_clip)
+                # damped Newton on V: (Jq + mu I) dq = -F   (pinv only)
+                A = Jq + mu * np.eye(n)
+                dq_newton = - (np.linalg.pinv(A, rcond=1e-12) @ F)
+                # trust-region clip
+                dq_newton = np.clip(dq_newton, -step_clip, step_clip)
 
-                c_try, s_try = rotate_cs(c, s, dq)
-                th_try = theta_from_cs(c_try, s_try)
-                F_try = pin.computeGeneralizedGravity(self.model, self.data, th_try) + K_eff @ (th_try - theta_cmd)
-
-                if (not monotonic) or (np.linalg.norm(F_try) <= np.linalg.norm(F)):
+                # backtracking on V
+                V_cur = V_total(th, K_eff)
+                accept = False
+                dq_try = dq_newton.copy()
+                for _bt in range(backtrack_max):
+                    c_try, s_try = rotate_cs(c, s, dq_try)
+                    th_try = theta_from_cs(c_try, s_try)
+                    V_try = V_total(th_try, K_eff)
+                    if V_try <= V_cur:  # monotone in energy
+                        accept = True
+                        break
+                    dq_try *= backtrack_shrink
+                if accept:
                     c, s = c_try, s_try
-                    mu = max(lm_mu0, mu * 0.33)
+                    mu = max(newton_mu0, mu * 0.33)
                 else:
-                    mu = min(lm_mu_max, mu * 3.0)
+                    # reject but still continue; increase damping for next step
+                    mu = min(newton_mu_max, mu * 3.0)
 
             self.eq_path_last.append(theta_from_cs(c, s).copy())
 
